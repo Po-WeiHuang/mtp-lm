@@ -1,0 +1,7 @@
+###############################################################################
+metamath-strat-split-val:
+  address: jwkirchenbauer/metamathqa-grouped-split
+  split: validation
+  template_fn: query_resp_chat
+  category: gsm
+###############################################################################

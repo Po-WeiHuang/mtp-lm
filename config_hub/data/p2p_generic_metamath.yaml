@@ -1,0 +1,6 @@
+raw_dir: outputs/p2p_tok_generic_metamath/raw
+hf_tokenizer: checkpoints/meta-llama/Meta-Llama-3.1-8B
+output_dir: outputs/p2p_tok_generic_metamath
+target_shard_num: 32
+target_block_size: 2048
+pack_setting: no_pack

@@ -1,0 +1,28 @@
+model: hf
+model_args:
+  pretrained: tomg-group-umd/debug_metamath_full_rand_k2-8_ex_valk_baseline_latest
+  dtype: float32
+
+trust_remote_code: true
+
+gen_kwargs:
+  do_sample: false
+  until:
+  - 'Q:'
+  - </s>
+  - <|end_of_text|>
+  - <|eot_id|>
+  - <|endoftext|>
+  - <|im_end|>
+  do_mtp: true
+  k_toks: 1
+  strategy: null
+  mask_id: 128002
+  eos_id: 128001
+  include_prompt: true
+
+batch_size: 1
+
+output_path: ./outputs/lm_eval
+log_samples: true
+

@@ -1,0 +1,13 @@
+###############################################################################
+magpie-pro-mt-300k-v0-1:
+  address: Magpie-Align/Magpie-Pro-MT-300K-v0.1
+  split: train
+  template_fn: convo_from_bos_only
+  category: reasoning
+###############################################################################
+magpie-reasoning-v1-150k:
+  address: Magpie-Align/Magpie-Reasoning-V1-150K
+  split: train
+  template_fn: convo_from_bos_only
+  category: reasoning
+###############################################################################
