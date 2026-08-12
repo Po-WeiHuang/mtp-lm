@@ -3,11 +3,12 @@
 set -e
 
 # specific to the HPC cluster, rm or modify as needed
-module load aws-ofi-nccl cuda nccl libfabric
+#module load aws-ofi-nccl cuda nccl libfabric
 
 REPO=$(pwd)
 
 # modify the installation path and env name if you want. Assumes $WRKSPC is set.
+WRKSPC="/data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/third_party/mtp-lm"
 INSTALLDIR=${WRKSPC}
 ENV_NAME="torch_210_cuda_129_singleshot"
 
@@ -21,13 +22,16 @@ echo "Conda Version:"
 conda env list | grep '*'
 
 # Create conda environment, and print whether it is loaded correctly
-conda create --prefix ${INSTALLDIR}/$ENV_NAME python=3.13.5 --yes -c defaults
-source activate ${INSTALLDIR}/$ENV_NAME
+#conda create --prefix ${INSTALLDIR}/$ENV_NAME python=3.13.5 --yes -c defaults
+#source activate ${INSTALLDIR}/$ENV_NAME
+source /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/miniforge3/etc/profile.d/conda.sh
+conda activate /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/.venv
+cd /data/phys-snoplus-snews/exet5937/aiproj/driftmtplm/third_party/mtp-lm
 echo "Pip Version:" $(which pip)  # should be from the new environment!
 
 # Also HPC cluster specific, remove if not relevant.
 # Conda packages:
-conda install -c conda-forge conda-pack libstdcxx-ng libhwloc --yes
+#conda install -c conda-forge conda-pack libstdcxx-ng  --yes
 
 ######### COMPILE PIP PACKAGES ########################
 

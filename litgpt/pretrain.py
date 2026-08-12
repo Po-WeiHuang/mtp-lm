@@ -78,7 +78,7 @@ def pt_ce_plus_ent_loss(logits_student=None, logits_teacher=None, labels_teacher
 
     if labels_teacher is not None:
         ent_teach = torch.tensor(0.0) # ent_teach will be treated as 0 in this case, bc teach_labels is 1-hot.
-        teach_labels = labels_teacher.flatten() # (BxL)x1
+        teach_labels = labels_teacher.flatten() # (BxL)x1erges all dimensions up to the second-to-last one into one dimension.
         ce_teach_stud = F.cross_entropy(stud_logits, teach_labels, reduction="mean") # 1x
         kl_teach_stud = ce_teach_stud # ... - ent_teach but 0 in this case.
     else:
@@ -1113,7 +1113,7 @@ def fit(
         for k in hparams.singleshot.topk_values:
             running_accuracies[k] = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics).to(fabric.device)
             running_confidences[k] = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics).to(fabric.device)
-
+            
     fabric.barrier()
     total_t0 = time.perf_counter()
 

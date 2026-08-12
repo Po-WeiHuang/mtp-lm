@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from args_data import DataSource, DataSources, P2PConfig
 
 import torch.distributed as dist
-from torch.distributed import timedelta
+from datetime import timedelta
 
 
 def extract_text_field(dataset, text_field="text", tokenizer=None, num_proc=None):
@@ -351,7 +351,7 @@ def pull_raw_datasets(
             print("Removing pull cache on rank 0...")
             import shutil
 
-            shutil.rmtree(cache_dir, ignore_errors=False)
+            shutil.rmtree(cache_dir, ignore_errors=True)
             print("pull cache removed.")
 
     print(f"Task {array_task_id} finished data pull.")

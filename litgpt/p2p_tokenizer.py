@@ -7,7 +7,6 @@ from pathlib import Path
 import contextlib
 import random
 
-import itertools
 import pyarrow.dataset as ds
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -25,7 +24,7 @@ from jsonargparse import CLI, set_parsing_settings
 from args_data import DataSource, DataSources, P2PConfig
 
 import torch.distributed as dist
-from torch.distributed import timedelta
+from datetime import timedelta
 
 
 def is_valid_parquet_file(file_path):
@@ -51,8 +50,10 @@ def weighted_file_selection(files, weight):
     )
 
 
-def _generate_tables(self, files):
-    for file_idx, file in enumerate(itertools.chain.from_iterable(files)):
+def _generate_tables(self, files, row_groups_list=None):
+    if row_groups_list is None:
+        row_groups_list = [None] * len(files)
+    for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
         with open(file, "rb") as f:
             try:
                 parquet_file = pq.ParquetFile(f)
@@ -63,7 +64,9 @@ def _generate_tables(self, files):
                     )
                     for batch_idx, record_batch in enumerate(
                         parquet_file.iter_batches(
-                            batch_size=batch_size, columns=self.config.columns
+                            batch_size=batch_size,
+                            row_groups=list(row_groups) if row_groups is not None else None,
+                            columns=self.config.columns,
                         )
                     ):
                         pa_table = pa.Table.from_batches([record_batch])
@@ -535,7 +538,7 @@ def parquet_to_parquet_tokenization(
             print("Removing tok cache on rank 0...")
             import shutil
 
-            shutil.rmtree(cache_dir, ignore_errors=False)
+            shutil.rmtree(cache_dir, ignore_errors=True)
             print("tok cache removed.")
 
     print(f"Task {array_task_id} finished tokenization.")
