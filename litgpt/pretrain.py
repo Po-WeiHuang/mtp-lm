@@ -1143,6 +1143,13 @@ def fit(
         input_ids = train_data[:, 0 : train_data_len].contiguous().long()
         target_ids = train_data[:, 1 : (train_data_len + 1)].contiguous().long()
 
+        # Read up front from hparams (not from `model.S`/`model.mask_region_ct`):
+        # validate() reconstructs the block mask on this same shared model with its
+        # own S/mask_region_ct, which otherwise leaks into the P/offset math below
+        # on the very next training step.
+        truncation_length = hparams.singleshot.truncation_length
+        mask_region_ct = hparams.singleshot.mask_region_ct
+
         if hparams.singleshot.rand_rank_k_toks:
             # rank based random k_toks sampling for multi-node multi-gpu runs
             rank_step_seed = state["step_count"] + fabric.global_rank * 12345678
@@ -1152,7 +1159,7 @@ def fit(
             k_toks = k_toks_rng.randint(k_toks_min, k_toks_max)
             # now, we need to reset the value of P because it will be used in offset computation below
             # but is now stale because we have a different k_toks than before
-            model.P = (model.S // model.mask_region_ct) - (k_toks - 1)
+            model.P = (truncation_length // mask_region_ct) - (k_toks - 1)
             model.block_mask_config["P"] = model.P
             model_teacher.P = model.P
             model_teacher.block_mask_config["P"] = model.P
@@ -1165,20 +1172,22 @@ def fit(
             k_toks = k_toks_rng.randint(k_toks_min, k_toks_max)
             # now, we need to reset the value of P because it will be used in offset computation below
             # but is now stale because we have a different k_toks than before
-            model.P = (model.S // model.mask_region_ct) - (k_toks - 1)
+            model.P = (truncation_length // mask_region_ct) - (k_toks - 1)
             model.block_mask_config["P"] = model.P
             model_teacher.P = model.P
             model_teacher.block_mask_config["P"] = model.P
         else:
             k_toks = hparams.singleshot.k_toks.get_value(state["step_count"])
-        
+
+        # Single source of truth for P this step, independent of whatever
+        # validate() may have mutated on model.block_mask_config since the last
+        # training step ran.
+        current_P = (truncation_length // mask_region_ct) - (k_toks - 1)
+
         data_bsz = input_ids.shape[0]
 
-        truncation_length = hparams.singleshot.truncation_length
-
-        mask_region_ct = hparams.singleshot.mask_region_ct
         tot_mask_regions = data_bsz * mask_region_ct # is also the total prefix regions, gt regions etc
-        
+
         # dynamically reconstruct the block masks for this k_toks, trunc length, bsz etc.
         rolling_offset = 0
         if hparams.singleshot.train_with_block_mask:
@@ -1188,16 +1197,16 @@ def fit(
                     # rank based offset rolling for multi-node multi-gpu runs
                     rank_step_seed = state["step_count"] + fabric.global_rank * 12345678
                     offset_rng = random.Random(rank_step_seed)
-                    rank_factor = offset_rng.randint(0, model.block_mask_config["P"] - 1)
+                    rank_factor = offset_rng.randint(0, current_P - 1)
                     rolling_offset = rank_factor * -1
                 elif hparams.singleshot.lockstep_rand_roll_offsets:
                     # lockstep random offset rolling across all ranks
                     step_seed = state["step_count"] * 12345
                     offset_rng = random.Random(step_seed)
-                    factor = offset_rng.randint(0, model.block_mask_config["P"] - 1)
+                    factor = offset_rng.randint(0, current_P - 1)
                     rolling_offset = factor * -1
                 else:
-                    rolling_offset = state["step_count"] % model.block_mask_config["P"] * -1
+                    rolling_offset = state["step_count"] % current_P * -1
 
             if hparams.pdb: print(f"Rank: {fabric.global_rank} | Step: {state['step_count']} | Sampled k_toks: {k_toks} | Rolling Offset: {rolling_offset}")
 
