@@ -66,7 +66,7 @@ from litgpt.utils import (
     dict2attr,
 )
 
-from litgpt.repetition_diversity_tokens import measure_repetition_and_diversity, dummy_rep_div_result
+from litgpt.repetition_diversity_tokens import measure_repetition_and_diversity
 
 
 def pt_ce_plus_ent_loss(logits_student=None, logits_teacher=None, labels_teacher=None, beta=None):
@@ -2444,7 +2444,12 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
 
 def compute_repetition_metrics(inputs):
 
-    stats_table = {k:[] for k,v in dummy_rep_div_result.items()}
+    # Only track n-gram levels 1-2 (plus the two summary metrics) to keep the
+    # per-run wandb chart count manageable -- levels 3-4 are still computed
+    # inside measure_repetition_and_diversity() (they feed into `diversity`),
+    # just not carried into the logged stats table.
+    tracked_keys = ["unique_1", "unique_2", "repetition_1", "repetition_2", "diversity", "log_diversity"]
+    stats_table = {k: [] for k in tracked_keys}
 
     for inp in inputs:
         if isinstance(inp, torch.Tensor):
