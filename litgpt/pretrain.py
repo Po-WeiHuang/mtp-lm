@@ -2448,12 +2448,12 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
 def compute_repetition_metrics(inputs):
 
     # Track unique_1-4 (repetition_n is dropped since repetition_n == 1 -
-    # unique_n, pure redundancy) plus the two summary metrics. Only
-    # mean/median/std get logged to wandb to keep the per-run chart count
-    # manageable; full per-example values are still available via
-    # stats_table (the "_lists" variant) for anyone who needs the full
-    # distribution.
-    tracked_keys = ["unique_1", "unique_2", "unique_3", "unique_4", "diversity", "log_diversity"]
+    # unique_n, pure redundancy) plus diversity (log_diversity dropped --
+    # redundant with diversity, just a rescaling of it). Only mean/median/std
+    # get logged to wandb to keep the per-run chart count manageable; full
+    # per-example values are still available via stats_table (the "_lists"
+    # variant) for anyone who needs the full distribution.
+    tracked_keys = ["unique_1", "unique_2", "unique_3", "unique_4", "diversity"]
     stats_table = {k: [] for k in tracked_keys}
 
     for inp in inputs:
