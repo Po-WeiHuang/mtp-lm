@@ -2395,16 +2395,13 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
             avg_per_row = [torch.mean(elm).item() for elm in col_data]
             avg_per_row = torch.tensor(avg_per_row)
             ents_confs_lists[col_name][metric_name] = avg_per_row.tolist()
-            quantiles = [0.05, 0.10, 0.25, 0.5, 0.75, 0.90, 0.95]
+            # Only log mean/std to wandb to keep the per-run chart count
+            # manageable; full per-example values are still available via
+            # ents_confs_lists for anyone who needs the full distribution.
             ents_confs_agg[col_name].update({
                 f"{metric_name}": avg_per_row.mean().item(),
                 f"{metric_name}_std": avg_per_row.std().item(),
-                f"{metric_name}_median": avg_per_row.median().item(),
-                f"{metric_name}_max": avg_per_row.max().item(),
-                f"{metric_name}_min": avg_per_row.min().item(),
-                f"{metric_name}_ct": avg_per_row.numel(),
             })
-            ents_confs_agg[col_name].update({f"{metric_name}_q{int(q*100)}": avg_per_row.quantile(q).item() for q in quantiles})
             for ri in range(hparams.singleshot.rollout_multiplier):
                 val_k_toks = hparams.singleshot.k_toks.get_value(state["step_count"])
                 start, end = ri*val_k_toks, (ri+1)*val_k_toks
@@ -2414,12 +2411,7 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
                 ents_confs_agg[f"{col_name} kx{ri}"].update({
                     f"{metric_name}": avg_per_row_ri.mean().item(),
                     f"{metric_name}_std": avg_per_row_ri.std().item(),
-                    f"{metric_name}_median": avg_per_row_ri.median().item(),
-                    f"{metric_name}_max": avg_per_row_ri.max().item(),
-                    f"{metric_name}_min": avg_per_row_ri.min().item(),
-                    f"{metric_name}_ct": avg_per_row_ri.numel(),
                 })
-                ents_confs_agg[f"{col_name} kx{ri}"].update({f"{metric_name}_q{int(q*100)}": avg_per_row_ri.quantile(q).item() for q in quantiles})
     for col_name in ents_confs_agg.keys():
         generation_stats_agg[col_name].update(ents_confs_agg[col_name])
         generation_stats_lists[col_name].update(ents_confs_lists[col_name])
@@ -2430,16 +2422,14 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
     for k,lst in all_output_forced_teach_losses.items():
         all_output_forced_teach_losses_lists[k] = lst
         loss_tensor = torch.tensor(lst)
-        quantiles = [0.05, 0.10, 0.25, 0.5, 0.75, 0.90, 0.95]
+        # Only log mean/std to wandb to keep the per-run chart count
+        # manageable; full per-example values are still available via
+        # all_output_forced_teach_losses_lists for anyone who needs the full
+        # distribution.
         all_output_forced_teach_losses_agg[k] = {
             "teach_loss": loss_tensor.mean().item(),
             "teach_loss_std": loss_tensor.std().item(),
-            "teach_loss_median": loss_tensor.median().item(),
-            "teach_loss_max": loss_tensor.max().item(),
-            "teach_loss_min": loss_tensor.min().item(),
-            "teach_loss_ct": loss_tensor.numel(),
         }
-        all_output_forced_teach_losses_agg[k].update({f"teach_loss_q{int(q*100)}": loss_tensor.quantile(q).item() for q in quantiles})
 
 
     # Clear memory
@@ -2465,16 +2455,13 @@ def compute_repetition_metrics(inputs):
     stats_table_agg = {}
     for k in stats_table.keys():
         stat_tensor = torch.tensor(stats_table[k])
-        quantiles = [0.05, 0.10, 0.25, 0.5, 0.75, 0.90, 0.95]
+        # Only log mean/std to wandb to keep the per-run chart count manageable;
+        # full per-example values are still available via stats_table (the
+        # "_lists" variant) for anyone who needs the full distribution.
         stats_table_agg.update({
             f"{k}": stat_tensor.mean().item(),
             f"{k}_std": stat_tensor.std().item(),
-            f"{k}_median": stat_tensor.median().item(),
-            f"{k}_max": stat_tensor.max().item(),
-            f"{k}_min": stat_tensor.min().item(),
-            f"{k}_ct": stat_tensor.numel(),
         })
-        stats_table_agg.update({f"{k}_q{int(q*100)}": stat_tensor.quantile(q).item() for q in quantiles})
 
     return stats_table_agg, stats_table
 
