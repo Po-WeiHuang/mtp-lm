@@ -2395,11 +2395,12 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
             avg_per_row = [torch.mean(elm).item() for elm in col_data]
             avg_per_row = torch.tensor(avg_per_row)
             ents_confs_lists[col_name][metric_name] = avg_per_row.tolist()
-            # Only log mean/std to wandb to keep the per-run chart count
-            # manageable; full per-example values are still available via
-            # ents_confs_lists for anyone who needs the full distribution.
+            # Only log mean/median/std to wandb to keep the per-run chart
+            # count manageable; full per-example values are still available
+            # via ents_confs_lists for anyone who needs the full distribution.
             ents_confs_agg[col_name].update({
                 f"{metric_name}": avg_per_row.mean().item(),
+                f"{metric_name}_median": avg_per_row.median().item(),
                 f"{metric_name}_std": avg_per_row.std().item(),
             })
             for ri in range(hparams.singleshot.rollout_multiplier):
@@ -2410,6 +2411,7 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
                 ents_confs_lists[f"{col_name} kx{ri}"][metric_name] = avg_per_row_ri.tolist()
                 ents_confs_agg[f"{col_name} kx{ri}"].update({
                     f"{metric_name}": avg_per_row_ri.mean().item(),
+                    f"{metric_name}_median": avg_per_row_ri.median().item(),
                     f"{metric_name}_std": avg_per_row_ri.std().item(),
                 })
     for col_name in ents_confs_agg.keys():
@@ -2422,12 +2424,13 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
     for k,lst in all_output_forced_teach_losses.items():
         all_output_forced_teach_losses_lists[k] = lst
         loss_tensor = torch.tensor(lst)
-        # Only log mean/std to wandb to keep the per-run chart count
+        # Only log mean/median/std to wandb to keep the per-run chart count
         # manageable; full per-example values are still available via
         # all_output_forced_teach_losses_lists for anyone who needs the full
         # distribution.
         all_output_forced_teach_losses_agg[k] = {
             "teach_loss": loss_tensor.mean().item(),
+            "teach_loss_median": loss_tensor.median().item(),
             "teach_loss_std": loss_tensor.std().item(),
         }
 
@@ -2444,11 +2447,13 @@ def generative_validate(hparams: dict2attr, state: dict, fabric: L.Fabric, model
 
 def compute_repetition_metrics(inputs):
 
-    # Only track n-gram levels 1-2 (plus the two summary metrics) to keep the
-    # per-run wandb chart count manageable -- levels 3-4 are still computed
-    # inside measure_repetition_and_diversity() (they feed into `diversity`),
-    # just not carried into the logged stats table.
-    tracked_keys = ["unique_1", "unique_2", "repetition_1", "repetition_2", "diversity", "log_diversity"]
+    # Track unique_1-4 (repetition_n is dropped since repetition_n == 1 -
+    # unique_n, pure redundancy) plus the two summary metrics. Only
+    # mean/median/std get logged to wandb to keep the per-run chart count
+    # manageable; full per-example values are still available via
+    # stats_table (the "_lists" variant) for anyone who needs the full
+    # distribution.
+    tracked_keys = ["unique_1", "unique_2", "unique_3", "unique_4", "diversity", "log_diversity"]
     stats_table = {k: [] for k in tracked_keys}
 
     for inp in inputs:
@@ -2460,11 +2465,9 @@ def compute_repetition_metrics(inputs):
     stats_table_agg = {}
     for k in stats_table.keys():
         stat_tensor = torch.tensor(stats_table[k])
-        # Only log mean/std to wandb to keep the per-run chart count manageable;
-        # full per-example values are still available via stats_table (the
-        # "_lists" variant) for anyone who needs the full distribution.
         stats_table_agg.update({
             f"{k}": stat_tensor.mean().item(),
+            f"{k}_median": stat_tensor.median().item(),
             f"{k}_std": stat_tensor.std().item(),
         })
 
