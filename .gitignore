@@ -3,4 +3,4 @@ litgpt.egg-info/
 *.log
 dwload_traindst_cmd_llama.sh
 dwload_traindst_cmd_qwen.sh
-
+figures_data_raw/
