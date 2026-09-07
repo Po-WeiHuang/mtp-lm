@@ -4,6 +4,7 @@
 from jsonargparse import CLI, set_parsing_settings
 
 import os
+import sys
 import math
 import pprint
 import time
@@ -1081,6 +1082,62 @@ def fit(
     initial_iter = state["iter_num"]
     train_iterator = CycleIterator(train_dataloader)
 
+    # `drift_enabled` is the master switch for *all* DriftMTP work. In particular,
+    # drift_diagnostics_enabled cannot independently enable imports, hidden-state
+    # requests, metrics, or auxiliary computation. This keeps a disabled run on the
+    # native MTP path regardless of any other drift-related configuration values.
+    drift_enabled = hparams.singleshot.drift_enabled
+
+    # DriftMTP Phase 2 (diagnostic-only): resolve the compute_training_diagnostics hook once,
+    # only when the master switch and diagnostics are both enabled, so a disabled run
+    # never imports or touches src/driftmtp/ at all.
+    # See claudedriftingplan.md > Validation Metrics > Decided Implementation (Phase 2 scope).
+    compute_training_diagnostics_fn = None
+    mmd_bandwidth_schedule = None
+    if drift_enabled and hparams.singleshot.drift_diagnostics_enabled:
+        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
+        if _driftmtp_src_dir not in sys.path:
+            sys.path.insert(0, _driftmtp_src_dir)
+        from driftmtp.validation import compute_training_diagnostics as compute_training_diagnostics_fn
+        from driftmtp.metrics.mmd import MMDBandwidthSchedule
+        # One shared instance for the whole run: recomputes the MMD kernel bandwidth from
+        # horizon-1 features on every diagnostic step while warming up, then freezes it, so
+        # the MMD trend over training is measured against one fixed baseline. See mmd.py.
+        mmd_bandwidth_schedule = MMDBandwidthSchedule(
+            warmup_steps=hparams.singleshot.drift_diagnostics_mmd_warmup_steps
+        )
+
+    # DriftMTP Phase 4 (training): resolve the token-drifting loss hook once, only when
+    # enabled, so a disabled run never imports or touches src/driftmtp/ at all (same pattern as
+    # the Phase 2 diagnostics hook above -- the sys.path insertion is idempotent and shared).
+    # See claudedriftingplan.md > PHASE 4 -- Training Integration.
+    compute_drift_loss_fn = None
+    drift_accum_tracker = None
+    running_drift_loss = None
+    if drift_enabled:
+        assert not hparams.singleshot.gt_teacher_supervision, (
+            "singleshot.drift_enabled requires the student-forced teacher pass, which "
+            "gt_teacher_supervision skips entirely."
+        )
+        assert not hparams.singleshot.last_region_loss_only, (
+            "singleshot.drift_enabled + last_region_loss_only is not yet supported: "
+            "last_region_loss_only reslices soft_stud_preds/soft_teach_preds to the last masked "
+            "region only, but leaves pred_pos_mask/tot_mask_regions (which the drift loss reuses "
+            "to slice student_hidden/teacher_hidden) pointing at all regions -- the drift loss "
+            "would silently train on a different region population than L_MTP. Out of scope for "
+            "PHASE 4; revisit if this combination is needed."
+        )
+        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
+        if _driftmtp_src_dir not in sys.path:
+            sys.path.insert(0, _driftmtp_src_dir)
+        from driftmtp.training import DriftAccumulationTracker
+        from driftmtp.training import compute_drift_loss as compute_drift_loss_fn
+        drift_accum_tracker = DriftAccumulationTracker(
+            temperatures=hparams.singleshot.drift_temperatures,
+            window=train.gradient_accumulation_iters(devices, num_nodes),
+        )
+        running_drift_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
+
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
     running_grad_norm = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
 
@@ -1137,6 +1194,24 @@ def fit(
             param_group["lr"] = lr
 
         state["iter_num"] += 1
+
+        # DriftMTP Phase 2 (diagnostic-only): only compute/request hidden states on iterations
+        # that will actually be logged, so a disabled (or between-log) step pays zero extra cost.
+        # Requires the student-forced teacher pass, so it is inapplicable under
+        # gt_teacher_supervision (which skips that pass entirely).
+        run_drift_diagnostics = (
+            drift_enabled
+            and (compute_training_diagnostics_fn is not None)
+            and (state["iter_num"] % log_iter_interval == 0)
+            and (not hparams.singleshot.gt_teacher_supervision)
+        )
+        drift_diagnostics = {}
+
+        # DriftMTP Phase 4 (training): unlike run_drift_diagnostics above, this must be True on
+        # EVERY iteration drift training is enabled (L_drift needs to backprop every step, not
+        # just on logged iterations) -- so hidden states are requested whenever either consumer
+        # needs them. gt_teacher_supervision is already asserted against at hook-resolution time.
+        need_hidden_states = drift_enabled
 
         data_mask_prep_t0 = time.perf_counter()
         train_data_len = train_data.shape[1] - 1
@@ -1322,7 +1397,11 @@ def fit(
             
             fwd_t0 = time.perf_counter()
             # 1. student prediction pass
-            logits = model(input_ids)
+            student_fwd_out = model(input_ids, return_hidden_states=need_hidden_states)
+            if need_hidden_states:
+                logits, student_hidden = student_fwd_out
+            else:
+                logits, student_hidden = student_fwd_out, None
             soft_stud_preds = logits[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
 
             # 1.1 prep for aux prefix supervision
@@ -1351,9 +1430,34 @@ def fit(
 
             if not hparams.singleshot.gt_teacher_supervision:
                 with torch.no_grad():
-                    logits_teacher = model_teacher(stud_forcing_input_ids)
+                    teacher_fwd_out = model_teacher(
+                        stud_forcing_input_ids, return_hidden_states=need_hidden_states
+                    )
+                    if need_hidden_states:
+                        logits_teacher, teacher_hidden = teacher_fwd_out
+                    else:
+                        logits_teacher, teacher_hidden = teacher_fwd_out, None
                     soft_teach_preds = logits_teacher[pred_pos_mask].view(tot_mask_regions, k_toks, -1)
                     hard_teach_preds = torch.argmax(soft_teach_preds, dim=-1)
+
+                    # DriftMTP Phase 2 (diagnostic-only): ECE (vs. hard teacher label) + per-horizon
+                    # MMD/Sinkhorn between student and teacher predictive states, at the anchor
+                    # horizon set {1,2,3,mid,k_toks}. Reuses this step's forward passes and the
+                    # same pred_pos_mask already used above; no extra forward pass, no extra
+                    # dataloader, no effect on `loss`/gradients/parameters. See
+                    # claudedriftingplan.md > Validation Metrics > Decided Implementation.
+                    if run_drift_diagnostics:
+                        drift_diagnostics = compute_training_diagnostics_fn(
+                            student_hidden_full=student_hidden,
+                            teacher_hidden_full=teacher_hidden,
+                            student_logits_full=soft_stud_preds,
+                            hard_teacher_labels_full=hard_teach_preds,
+                            pred_pos_mask=pred_pos_mask,
+                            tot_mask_regions=tot_mask_regions,
+                            k_toks=k_toks,
+                            bandwidth_schedule=mmd_bandwidth_schedule,
+                            step=state["iter_num"],
+                        )
 
             if hparams.singleshot.last_region_loss_only:
                 assert not (hparams.data == "pqds" and hparams.pqds.omit_tail_padding_in_loss), "Not supported to omit tail padding when using last_region_loss_only."
@@ -1456,13 +1560,52 @@ def fit(
                 assert gt_prefix_ids.shape[1] > 0, "There must be some prefix tokens to supervise if using this setting."
                 loss = avg_gt_forced_prefix_loss
 
-            bwd_t0 = time.perf_counter()       
-            fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
-            bwd_t1 = time.perf_counter()       
+            # DriftMTP Phase 4: L_total = L_MTP + lambda_drift * L_drift^token. `loss` above (the
+            # native MTP(+prefix) loss) is left untouched so its own logging/running-mean
+            # semantics are unchanged; drift_loss is computed and backpropagated separately here.
+            # drift_weight=0.0 (the default whenever drift_enabled=True) makes this an exact
+            # (not just approximate) no-op on the backward pass -- the Phase 4
+            # backward-compatibility test.
+            # Timed separately from time_prefix_loss/time_bwd: the drift loss builds R x R
+            # pairwise distance matrices per horizon per temperature, and PHASE 5 asks
+            # specifically to check for "large slowdown from pairwise distance matrices".
+            # Without its own timer this cost lands in no time_* bucket at all (only in
+            # time_iter_total), so the check would have nothing to read.
+            drift_loss_t0 = time.perf_counter()
+            drift_loss = torch.tensor(0.0, device=fabric.device)
+            if drift_enabled:
+                drift_result = compute_drift_loss_fn(
+                    student_hidden_full=student_hidden,
+                    teacher_hidden_full=teacher_hidden,
+                    pred_pos_mask=pred_pos_mask,
+                    tot_mask_regions=tot_mask_regions,
+                    k_toks=k_toks,
+                    temperatures=hparams.singleshot.drift_temperatures,
+                    eta=hparams.singleshot.drift_step_size,
+                    use_column_norm=hparams.singleshot.drift_use_column_norm,
+                    exclude_self_positive=hparams.singleshot.drift_exclude_self_positive,
+                )
+                drift_loss = drift_result.loss
+                drift_accum_tracker.update(drift_result.per_horizon_results, k_toks)
+                # lambda_drift is a fixed constant for the whole run. It is deliberately
+                # NOT adapted to hold a constant L_drift/L_MTP ratio: the drift term is
+                # meant to fade as the student population converges to the teacher, via
+                # rms_field_normalize's V / (lambda_tau + eps) damping once a temperature's
+                # raw field falls below eps. Holding the ratio fixed would defeat that.
+                total_loss = loss + hparams.singleshot.drift_weight * drift_loss
+            else:
+                total_loss = loss
+            drift_loss_t1 = time.perf_counter()
+
+            bwd_t0 = time.perf_counter()
+            fabric.backward(total_loss / train.gradient_accumulation_iters(devices, num_nodes))
+            bwd_t1 = time.perf_counter()
 
         post_bwd_t0 = time.perf_counter()
         loss_rank0 = loss.detach()
         running_loss.update(loss_rank0)
+        if drift_enabled:
+            running_drift_loss.update(drift_loss.detach())
 
         running_ce_teach_stud.update(ce_teach_stud.detach())
         running_kl_teach_stud.update(kl_teach_stud.detach())
@@ -1602,6 +1745,7 @@ def fit(
                 "time_metrics": metrics_t1 - metrics_t0,
                 "time_main_loss": main_loss_t1 - main_loss_t0,
                 "time_prefix_loss": prefix_loss_t1 - prefix_loss_t0,
+                "time_drift_loss": drift_loss_t1 - drift_loss_t0,
                 "time_bwd": bwd_t1 - bwd_t0,
                 "time_post_bwd": post_bwd_t1 - post_bwd_t0,
                 "time_grad_clip": grad_clip_t1 - grad_clip_t0,
@@ -1628,6 +1772,40 @@ def fit(
                 "consumed_toks_per_sec_per_device": consumed_toks_per_sec_per_device,
             }
             metrics.update(gt_forced_prefix_loss)
+            # DriftMTP Phase 2 (diagnostic-only): no-op dict {} on iterations where
+            # run_drift_diagnostics was False (disabled, off-cadence, or gt_teacher_supervision).
+            metrics.update(drift_diagnostics)
+            # DriftMTP Phase 4 (training): native/drift/total loss + the S_j / lambda_{tau,j} /
+            # field-RMS gradient-accumulation stability triplet (mean, std, mean/std ratio) over
+            # this optimizer step's micro-substeps. See claudedriftingplan.md > PHASE 4 >
+            # "Gradient-accumulation stability logging". native_mtp_loss duplicates `loss` above
+            # under the `drift/` prefix so all three loss terms are grouped together for readers.
+            if drift_enabled:
+                native_mtp_loss = loss_rank0.item()
+                mean_drift_loss = running_drift_loss.compute().item()
+                effective_drift_weight = hparams.singleshot.drift_weight
+                weighted_drift_loss = effective_drift_weight * mean_drift_loss
+                drift_metrics = {
+                    "drift/native_mtp_loss": native_mtp_loss,
+                    "drift/loss": mean_drift_loss,
+                    "drift/lambda_effective": effective_drift_weight,
+                    "drift/weighted_loss": weighted_drift_loss,
+                    "drift/total_loss": native_mtp_loss + weighted_drift_loss,
+                    # Cheap proxy for the paper's "auxiliary/native gradient ratio if available":
+                    # a true per-parameter gradient-norm ratio needs a second backward pass per
+                    # logged iteration (doubling backward cost), which the spec explicitly marks
+                    # optional ("if available") -- this loss-magnitude ratio is used instead.
+                    #
+                    # lambda_drift is fixed, so this ratio is free-running: it is calibrated
+                    # to ~0.10 at the start of the run and is EXPECTED to fall from there as
+                    # L_MTP decays and the drift field is damped by eps. A ratio pinned flat
+                    # at its initial value means the eps fade never engaged (check
+                    # drift/raw_field_rms_tau_* against eps); a ratio that climbs means
+                    # L_MTP is falling faster than the drift term is fading.
+                    "drift/aux_native_loss_ratio": weighted_drift_loss / (abs(native_mtp_loss) + 1e-8),
+                }
+                drift_metrics.update(drift_accum_tracker.compute(prefix="drift"))
+                metrics.update(drift_metrics)
             # extra metrics block
             if hparams.singleshot.extra_train_metrics:
                 metrics.update(stud_forced_teach_loss)

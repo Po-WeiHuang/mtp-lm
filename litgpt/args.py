@@ -2,7 +2,7 @@
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -329,6 +329,80 @@ class SingleShotArgs:
 
     last_region_loss_only: bool = False
     """Debug flag for only computing single-shot loss on the last masked region during training when using multiple masked regions."""
+
+    drift_diagnostics_enabled: bool = False
+    """DriftMTP Phase 2: whether to compute diagnostic-only ECE/MMD/Sinkhorn metrics comparing
+    student and teacher predictive states during training (see src/driftmtp/validation.py and
+    claudedriftingplan.md > Validation Metrics). Purely diagnostic: never affects the training
+    objective, gradients, or model parameters. Computed only on the same iterations already
+    gated by train.log_interval, reusing that step's existing student/teacher forward passes
+    (no extra forward pass, no extra dataloader). Default False recovers exactly the prior
+    (pre-DriftMTP) training behavior."""
+
+    drift_diagnostics_mmd_warmup_steps: int = 2000
+    """DriftMTP Phase 2: number of training iterations (state["iter_num"], NOT optimizer steps
+    or diagnostic-call count) over which the shared MMD kernel bandwidth is recomputed from
+    horizon-1 features on each diagnostic step; frozen at its last value for every iteration
+    after this. Deliberately independent of train.lr_warmup_steps (a different concept -- LR
+    schedule vs. kernel-scale stabilization), not derived from it. Must be several multiples of
+    log_iter_interval (train.log_interval * gradient_accumulation_iters) to actually let the
+    bandwidth recompute more than once before freezing, since diagnostics -- and therefore
+    bandwidth updates -- only run on log_iter_interval-aligned iterations. See
+    src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the policy this implements."""
+
+    drift_enabled: bool = False
+    """DriftMTP Phase 4: whether to add lambda_drift * L_drift^token (see
+    src/driftmtp/training.py and claudedriftingplan.md > PHASE 4 -- Training Integration) to the
+    training objective, so L_total = L_MTP + lambda_drift * L_drift^token. Requires the
+    student-forced teacher pass, so it is inapplicable under gt_teacher_supervision (asserted at
+    runtime). Default False recovers exactly the prior (pre-DriftMTP) training behavior. Setting
+    drift_enabled=True with drift_weight=0.0 MUST reproduce native MTP training numerically
+    (the drift loss is still computed every iteration, but its exact-zero contribution to the
+    backward pass leaves gradients unchanged) -- this is the Phase 4 backward-compatibility test."""
+
+    drift_weight: float = 0.0
+    """DriftMTP Phase 4: lambda_drift, the token drifting loss weight. Only has an effect when
+    drift_enabled=True. Default 0.0 is deliberately inert even when drift_enabled=True, so
+    turning drift_enabled on by itself never changes the training objective.
+
+    This is a FIXED constant for the whole run. Calibrate it so the weighted drift term is a
+    chosen fraction of L_MTP at the START of training (~10% is the working default), then let
+    it decay on its own: rms_field_normalize divides by (lambda_tau + eps), so a temperature
+    whose raw field falls below eps stops being renormalized back to unit scale and its
+    contribution decays toward zero as the student population converges to the teacher. An
+    adaptive weight that pinned lambda_drift * L_drift / L_MTP to a constant was tried and
+    removed, because it holds the drift term up forever and defeats exactly that fade."""
+
+    drift_exclude_self_positive: bool = True
+    """DriftMTP: mask the query's OWN paired teacher token out of the positive population,
+    mirroring the self-exclusion that has always been applied to the negative population.
+
+    y_pos[r] is the teacher state for the SAME token as the student query x[r]. As the student
+    converges toward the teacher that pair's distance goes to zero and, at low tau, its softmax
+    weight goes to 1 -- the positive mass collapses onto a single self-pair, while the negative
+    population still has its own self-pair removed. That asymmetry leaves a systematic residual
+    field that does not vanish at equilibrium, so "student == teacher" is NOT a fixed point of
+    the original construction. Masking both sides restores the symmetry the paper's unpaired
+    positives have for free.
+
+    True (default) is the symmetric construction. False reproduces the original asymmetric one;
+    use it only to reproduce runs from before this change."""
+
+    drift_temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+    """DriftMTP Phase 4: the base Laplace-kernel temperatures tau (claudedriftingplan.md >
+    Drifting Normalization > Kernel Temperature), SUMMED after per-temperature RMS field
+    normalization (Multi-Temperature Field Normalization). Default matches the paper's
+    {0.02, 0.05, 0.2}."""
+
+    drift_step_size: float = 1.0
+    """DriftMTP Phase 4: eta, the step size applied to the multi-temperature drift field before
+    forming the stopped-gradient drift target in L_drift^token (claudedriftingplan.md > Token
+    Drifting Loss)."""
+
+    drift_use_column_norm: bool = True
+    """DriftMTP Phase 4: forwards to src/driftmtp/drifting.py's `use_column_norm` toggle
+    (claudedriftingplan.md > Column-Normalization Toggle). True (default) uses Algorithm 2's
+    row+column geometric-mean affinity; False uses Eq. 8's separately-normalized affinity."""
 
 
 def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):

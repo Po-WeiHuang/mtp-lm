@@ -204,7 +204,8 @@ class GPT(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        return_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
         positions smaller than entries in `input_pos`. For efficiency, pass
@@ -225,12 +226,20 @@ class GPT(nn.Module):
             input_pos_maxp1: Optional. See above.
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            return_hidden_states: Optional, default False. If True, also
+                return the final-layer hidden state (post `ln_f`, pre
+                `lm_head`), shape `(B, T, config.n_embd)`, as a second
+                return value: `(logits, hidden_states)`. DriftMTP
+                integration hook (see `src/driftmtp/`); does not affect the
+                return value when left at its default.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
             `lm_head_chunk_size > 0`, this is a list of chunks of shape
             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
-            entry can be shorter.
+            entry can be shorter. If `return_hidden_states` is True, a
+            `(logits, hidden_states)` tuple is returned instead, where
+            `logits` is exactly the value described above.
 
         """
         T = idx.size(1)
@@ -297,9 +306,13 @@ class GPT(nn.Module):
         )
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
-            return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
+            logits = [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
         else:
-            return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+            logits = clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+
+        if return_hidden_states:
+            return logits, x  # x: (B, T, config.n_embd), post-ln_f, pre-lm_head
+        return logits
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
