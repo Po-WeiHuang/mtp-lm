@@ -1,5 +1,7 @@
 import time
 import json
+import math
+import numbers
 import os
 import warnings
 from pathlib import Path
@@ -24,6 +26,126 @@ def flatten_results(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
         else:
             items[new_key] = value
     return items
+
+
+# --- controlled-rollout diagnostic (docs/controlled_rollout_plan.md Phase 5a) ---
+# Third metric namespace beside "{task}/<benchmark metric>" and "{task}/samples/...".
+# These keys ride the existing run.log() call below, in the existing run, at the
+# existing step -- nothing about the free-rollout path changes.
+
+# Per-horizon record fields -> "{task}/controlled/<field>/h{j}". Thin horizons
+# omit "mmd"/"sinkhorn" entirely (condrollouteval drops them rather than writing
+# NaN when a horizon has too few samples), so every field is looked up optionally.
+_CONTROLLED_PER_HORIZON_KEYS = (
+    "ece_stud_gt",
+    "ece_stud_teach",
+    "ece_stud_gt_joint",
+    "ece_stud_teach_joint",
+    "mean_joint_confidence",
+    "mmd",
+    "sinkhorn",
+    "n_samples",
+    # Bin-occupancy diagnostics for the two ECEs above -- how many bins the
+    # population reached, how concentrated it was, and how much of each ECE
+    # came from bins holding fewer than `thin_bin_below` regions. They change
+    # no ECE; they say how much to trust one.
+    "ece_bins_populated",
+    "ece_max_bin_weight",
+    "ece_min_bin_count",
+    "ece_thin_bin_share",
+    "ece_joint_bins_populated",
+    "ece_joint_max_bin_weight",
+    "ece_joint_min_bin_count",
+    "ece_joint_thin_bin_share",
+)
+
+# "aggregate" fields -> "{task}/controlled/<field>". The two bare *_joint keys are
+# the headline ECEs (deepest horizon's joint value) a sweep plots against
+# avg_effective_k. "mmd/mean" and "sinkhorn/mean" already carry their own slash.
+_CONTROLLED_AGGREGATE_KEYS = (
+    "ece_stud_gt_joint",
+    "ece_stud_teach_joint",
+    "mmd/mean",
+    "sinkhorn/mean",
+    "avg_effective_k",
+)
+
+# Scalar fields copied into wandb config as config_controlled_rollout_*. lm_eval
+# builds results["config"] from a fixed key list that excludes metadata, so the
+# pusher has to carry these itself.
+_CONTROLLED_CONFIG_KEYS = (
+    "k_toks",
+    "strategy",
+    "truncation_length",
+    "mask_region_ct",
+    "offset",
+    "max_pool_samples",
+    "seed",
+    "student_checkpoint",
+    "teacher_checkpoint",
+    "mmd_bandwidth",
+)
+
+
+def flatten_controlled_rollout(
+    payload: Dict[str, Any], task_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """Flatten a controlled_rollout_<timestamp>.json payload into wandb keys.
+
+    Cannot reuse `flatten_results`: `per_horizon` is a *list* of records and
+    `flatten_results` only walks dicts.
+    """
+    task_header = f"{task_name}/" if task_name is not None else ""
+    prefix = f"{task_header}controlled/"
+    metrics: Dict[str, Any] = {}
+
+    for record in payload.get("per_horizon", []) or []:
+        horizon = record.get("horizon")
+        if horizon is None:
+            continue
+        for key in _CONTROLLED_PER_HORIZON_KEYS:
+            if key in record:
+                metrics[f"{prefix}{key}/h{horizon}"] = record[key]
+
+    aggregate = payload.get("aggregate", {}) or {}
+    for key in _CONTROLLED_AGGREGATE_KEYS:
+        if key in aggregate:
+            metrics[f"{prefix}{key}"] = aggregate[key]
+
+    if "n_documents" in payload:
+        metrics[f"{prefix}n_documents"] = payload["n_documents"]
+
+    return metrics
+
+
+def _is_non_finite(value: Any) -> bool:
+    """True for NaN/inf numerics, False for anything non-numeric (incl. bools)."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Number):
+        return False
+    try:
+        return not math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def scrub_non_finite(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace every non-finite float with None, naming the offenders.
+
+    A single NaN reaching wandb costs the entire run's row when the summary is
+    later pulled into a CSV, so this runs before both the dry-run print and
+    run.log(). `df[col].std()` on a single-row task already produces NaN today,
+    and thin controlled-rollout horizons add more columns that can go non-finite.
+    """
+    offenders = [k for k, v in metrics.items() if _is_non_finite(v)]
+    if offenders:
+        warnings.warn(
+            f"replacing {len(offenders)} non-finite metric value(s) with None: "
+            + ", ".join(sorted(offenders)),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        metrics = {k: (None if _is_non_finite(v) else v) for k, v in metrics.items()}
+    return metrics
 
 
 def match_tok_id_prefix_to_resp(
@@ -246,6 +368,10 @@ def parse_eval_results(
 
     result_files = sorted(list(run_dir.rglob("results_*.json")))
     sample_files = sorted(list(run_dir.rglob("samples_*.jsonl")))
+    # Controlled rollout writes one file per run into the SAME run_dir (at parent
+    # level, while lm_eval nests its own output a directory deeper) -- rglob finds
+    # either. Same sorted()[-1] rule: ISO timestamps sort chronologically.
+    controlled_files = sorted(list(run_dir.rglob("controlled_rollout_*.json")))
 
     if not result_files:
         print(f"No result files found in {run_dir}")
@@ -261,6 +387,14 @@ def parse_eval_results(
 
     results_payload = raw_data.pop("results", {})
     metrics_to_log = flatten_results(results_payload)
+
+    # Absent controlled file -> skip silently; free rollout still pushes alone.
+    controlled_payload = None
+    if controlled_files:
+        latest_controlled_path = controlled_files[-1]
+        print(f"Processing controlled rollout: {latest_controlled_path.name}")
+        with open(latest_controlled_path, "r") as f:
+            controlled_payload = json.load(f)
     # assert len(results_payload.keys()) == 1, "Expected results payload to contain exactly one key (the task name)."
     # task_name = list(results_payload.keys())[0]
 
@@ -309,15 +443,19 @@ def parse_eval_results(
         # Example usage of tokenizer if needed
         # e.g., decoding or encoding operations can be performed here
 
+    # Reset ONCE, before the loop: resetting inside it wiped every previously
+    # processed task's sample metrics on each later iteration, and would wipe the
+    # controlled metrics too.
+    if samples_only:
+        print("Samples only flag is set. Logging only sample metrics.")
+        metrics_to_log = {}
+
     for task_name, latest_samples_path in zip(task_names, latest_samples_paths):
         print(f"Processing task: {task_name}")
 
         if latest_samples_path:
             print(f"Found corresponding samples: {latest_samples_path.name}")
 
-            if samples_only:
-                print("Samples only flag is set. Logging only sample metrics.")
-                metrics_to_log = {}
             sample_metrics = process_samples(
                 latest_samples_path,
                 task_name=task_name,
@@ -327,6 +465,27 @@ def parse_eval_results(
                 do_retok=do_retok,
             )
             metrics_to_log.update(sample_metrics)
+
+    # Merged after the per-task loop so the samples_only reset cannot wipe it.
+    if controlled_payload is not None:
+        controlled_task = controlled_payload.get("task") or (
+            task_names[0] if len(task_names) == 1 else None
+        )
+        metrics_to_log.update(
+            flatten_controlled_rollout(controlled_payload, task_name=controlled_task)
+        )
+        # Surfaces at hop 5 as config_controlled_rollout_k_toks and friends.
+        # strategy is stringified for the same GUI reason as gen_kwargs.strategy.
+        controlled_config = {
+            key: controlled_payload[key]
+            for key in _CONTROLLED_CONFIG_KEYS
+            if key in controlled_payload
+        }
+        if "strategy" in controlled_config:
+            controlled_config["strategy"] = str(controlled_config["strategy"])
+        raw_data["controlled_rollout"] = controlled_config
+
+    metrics_to_log = scrub_non_finite(metrics_to_log)
 
     if dry_run:
         print("\n--- DRY RUN: Metrics that would be logged ---")

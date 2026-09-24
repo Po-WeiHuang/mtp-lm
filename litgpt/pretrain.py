@@ -1082,19 +1082,20 @@ def fit(
     initial_iter = state["iter_num"]
     train_iterator = CycleIterator(train_dataloader)
 
-    # `drift_enabled` is the master switch for *all* DriftMTP work. In particular,
-    # drift_diagnostics_enabled cannot independently enable imports, hidden-state
-    # requests, metrics, or auxiliary computation. This keeps a disabled run on the
-    # native MTP path regardless of any other drift-related configuration values.
+    # `drift_enabled` gates the drift LOSS/weight path (Phase 4, below): the L_drift term
+    # added to the training loss. `drift_diagnostics_enabled` is independent of it -- it can
+    # be turned on with drift_enabled=False to observe ECE/MMD/Sinkhorn drift metrics without
+    # any drift loss/weight being computed or applied to the backward pass.
     drift_enabled = hparams.singleshot.drift_enabled
 
     # DriftMTP Phase 2 (diagnostic-only): resolve the compute_training_diagnostics hook once,
-    # only when the master switch and diagnostics are both enabled, so a disabled run
-    # never imports or touches src/driftmtp/ at all.
+    # gated on drift_diagnostics_enabled alone (independent of drift_enabled), so a run with
+    # diagnostics on and drift training off still imports src/driftmtp/ and computes metrics,
+    # while a run with both off never touches src/driftmtp/ at all.
     # See claudedriftingplan.md > Validation Metrics > Decided Implementation (Phase 2 scope).
     compute_training_diagnostics_fn = None
     mmd_bandwidth_schedule = None
-    if drift_enabled and hparams.singleshot.drift_diagnostics_enabled:
+    if hparams.singleshot.drift_diagnostics_enabled:
         _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
         if _driftmtp_src_dir not in sys.path:
             sys.path.insert(0, _driftmtp_src_dir)
@@ -1198,10 +1199,11 @@ def fit(
         # DriftMTP Phase 2 (diagnostic-only): only compute/request hidden states on iterations
         # that will actually be logged, so a disabled (or between-log) step pays zero extra cost.
         # Requires the student-forced teacher pass, so it is inapplicable under
-        # gt_teacher_supervision (which skips that pass entirely).
+        # gt_teacher_supervision (which skips that pass entirely). Independent of drift_enabled:
+        # diagnostics can run with drift training off (compute_training_diagnostics_fn is only
+        # non-None when drift_diagnostics_enabled resolved the hook above).
         run_drift_diagnostics = (
-            drift_enabled
-            and (compute_training_diagnostics_fn is not None)
+            (compute_training_diagnostics_fn is not None)
             and (state["iter_num"] % log_iter_interval == 0)
             and (not hparams.singleshot.gt_teacher_supervision)
         )
@@ -1209,9 +1211,11 @@ def fit(
 
         # DriftMTP Phase 4 (training): unlike run_drift_diagnostics above, this must be True on
         # EVERY iteration drift training is enabled (L_drift needs to backprop every step, not
-        # just on logged iterations) -- so hidden states are requested whenever either consumer
-        # needs them. gt_teacher_supervision is already asserted against at hook-resolution time.
-        need_hidden_states = drift_enabled
+        # just on logged iterations). Hidden states are requested whenever either consumer needs
+        # them: drift_enabled (every step) or run_drift_diagnostics (logged steps only, when
+        # diagnostics are on but drift training is off). gt_teacher_supervision is already
+        # asserted against at hook-resolution time for the drift-loss path.
+        need_hidden_states = drift_enabled or run_drift_diagnostics
 
         data_mask_prep_t0 = time.perf_counter()
         train_data_len = train_data.shape[1] - 1
