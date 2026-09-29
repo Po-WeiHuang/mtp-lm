@@ -340,15 +340,15 @@ class SingleShotArgs:
     (pre-DriftMTP) training behavior."""
 
     drift_diagnostics_mmd_warmup_steps: int = 2000
-    """DriftMTP Phase 2: number of training iterations (state["iter_num"], NOT optimizer steps
-    or diagnostic-call count) over which the shared MMD kernel bandwidth is recomputed from
-    horizon-1 features on each diagnostic step; frozen at its last value for every iteration
-    after this. Deliberately independent of train.lr_warmup_steps (a different concept -- LR
-    schedule vs. kernel-scale stabilization), not derived from it. Must be several multiples of
-    log_iter_interval (train.log_interval * gradient_accumulation_iters) to actually let the
-    bandwidth recompute more than once before freezing, since diagnostics -- and therefore
-    bandwidth updates -- only run on log_iter_interval-aligned iterations. See
-    src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the policy this implements."""
+    """DriftMTP Phase 2: number of OPTIMIZER steps (state["step_count"], the same unit as
+    train.lr_warmup_steps; NOT micro-iterations or diagnostic-call count) over which the shared
+    MMD kernel bandwidth is recomputed from horizon-1 features on each diagnostic step; frozen
+    at its last value for every step after this. Set it equal to train.lr_warmup_steps to
+    freeze the bandwidth when the LR warmup ends; it is not derived from it automatically.
+    Must be several multiples of train.log_interval to actually let the bandwidth recompute
+    more than once before freezing, since diagnostics -- and therefore bandwidth updates --
+    only run on logged steps. See src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the
+    policy this implements."""
 
     drift_enabled: bool = False
     """DriftMTP Phase 4: whether to add lambda_drift * L_drift^token (see
@@ -403,6 +403,20 @@ class SingleShotArgs:
     """DriftMTP Phase 4: forwards to src/driftmtp/drifting.py's `use_column_norm` toggle
     (claudedriftingplan.md > Column-Normalization Toggle). True (default) uses Algorithm 2's
     row+column geometric-mean affinity; False uses Eq. 8's separately-normalized affinity."""
+
+    smoothl1_enabled: bool = False
+    """Add lambda_SL1 * L_SL1 (per-horizon Smooth-L1 of student predictive states onto the
+    stopped-gradient teacher states; see src/driftmtp/training.py compute_smoothl1_loss and
+    claudesmoothL1plan.md). Mutually exclusive with drift_enabled. Needs the student-forced
+    teacher pass, so incompatible with gt_teacher_supervision. smoothl1_weight=0.0 MUST
+    reproduce native MTP training exactly."""
+
+    smoothl1_weight: float = 0.0
+    """lambda_SL1, fixed. Default 0.0 is inert, mirroring drift_weight."""
+
+    smoothl1_beta_quantile: float = 0.9
+    """Quantile q of |student - teacher| that sets beta_j per horizon. beta_j is an EMA of
+    it during LR warmup and frozen afterwards. Must be in (0, 1)."""
 
 
 def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):
