@@ -84,6 +84,7 @@ _CONTROLLED_CONFIG_KEYS = (
     "student_checkpoint",
     "teacher_checkpoint",
     "mmd_bandwidth",
+    "min_band_samples",
 )
 
 
@@ -111,6 +112,15 @@ def flatten_controlled_rollout(
     for key in _CONTROLLED_AGGREGATE_KEYS:
         if key in aggregate:
             metrics[f"{prefix}{key}"] = aggregate[key]
+
+    # Per-confidence-band accuracy, already named by condrollouteval:
+    # "horizon_{j}_confband_{lo}_{hi}" -> {"n", "acc_stud_gt", "acc_stud_teach"}
+    # becomes "{task}/controlled/horizon_{j}_confband_{lo}_{hi}/<field>". Bands
+    # under min_band_samples carry only "n", so whatever fields are present are
+    # logged as-is.
+    for band, fields in (payload.get("confband", {}) or {}).items():
+        for key, value in fields.items():
+            metrics[f"{prefix}{band}/{key}"] = value
 
     if "n_documents" in payload:
         metrics[f"{prefix}n_documents"] = payload["n_documents"]
