@@ -257,11 +257,13 @@ def generate_fn(
         # For each stop sequence, we keep a running total of how many are matched in stop_progress.
         # If the current token matches the next token in the stop sequence, we increment the
         # running total and hold off on yielding the token.
-        for int_tok in int_token:
+        for j, int_tok in enumerate(int_token):
             for i, seq in enumerate(stop_tokens):
                 if int_tok == seq[stop_progress[i]]:
                     stop_progress[i] += 1
                     if stop_progress[i] == len(seq):
+                        # a multi-token step can draft past the stop token; drop what follows it in this block
+                        del tokens[len(tokens) - len(int_token) + j + 1 :]
                         if include_eos:
                             yield from tokens[yielded_idx:]
                             # print(f"\r{tokenizer.decode(torch.tensor(tokens))}".replace("\n","\\n"),end='\n', flush=True)

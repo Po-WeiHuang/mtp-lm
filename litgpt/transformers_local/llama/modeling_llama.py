@@ -748,7 +748,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
             # Check for stop sequences
             hit_stop_seq = False
-            for int_tok in next_tokens.tolist()[0]: # assuming batch size 1
+            for j, int_tok in enumerate(next_tokens.tolist()[0]): # assuming batch size 1
                 for i, seq in enumerate(stop_tokens):
                     if int_tok == seq[stop_progress[i]]:
                         stop_progress[i] += 1
@@ -760,6 +760,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 if hit_stop_seq:
                     break
             if hit_stop_seq:
+                # a multi-token step can draft past the stop token; drop what follows it in this block
+                num_after_stop = next_tokens.shape[1] - (j + 1)
+                if num_after_stop > 0:
+                    input_ids = input_ids[:, :-num_after_stop]
                 break
 
         # End of generation loop

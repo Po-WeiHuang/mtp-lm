@@ -348,7 +348,34 @@ class SingleShotArgs:
     Must be several multiples of train.log_interval to actually let the bandwidth recompute
     more than once before freezing, since diagnostics -- and therefore bandwidth updates --
     only run on logged steps. See src/driftmtp/metrics/mmd.py (MMDBandwidthSchedule) for the
-    policy this implements."""
+    policy this implements. The frozen value is saved in checkpoints and logged as
+    drift_diag/mmd_bandwidth."""
+
+    geometry_diag_enabled: bool = True
+    """Global student-teacher hidden-state geometry diagnostics (src/driftmtp/geometry.py,
+    distancdiagplan.md): per-horizon D_SS / D_TT / D_ST statistics, paired vs nearest-teacher
+    distance, pairing gap, paired-teacher rank, spread ratio, teacher local scale, MMD and
+    Sinkhorn, logged per horizon as diag/h{h}/*. Monitoring only and
+    independent of drift_enabled / smoothl1_enabled / drift_diagnostics_enabled, so baseline,
+    Smooth-L1 and drifting runs log identical fields. On by default; set false explicitly to
+    skip. Needs the student-forced teacher pass, so incompatible with gt_teacher_supervision
+    (configs using that must set this to false)."""
+
+    geometry_diag_interval: int = 100
+    """Optimizer steps between geometry diagnostics. Must be a positive multiple of
+    train.log_interval, so every computed step is also a logged step."""
+
+    geometry_diag_mmd_warmup_steps: int = 2000
+    """Optimizer steps over which the geometry hook's own MMD bandwidth is re-estimated from
+    horizon 1 on each diagnostic step before being frozen. Same policy as
+    drift_diagnostics_mmd_warmup_steps, but a separate MMDBandwidthSchedule instance, so the
+    diag/ MMD does not depend on whether drift diagnostics are also on. Saved in checkpoints
+    and logged as diag/mmd_bandwidth."""
+
+    geometry_diag_gather: bool = False
+    """Pool the diagnostic population across ranks (detached all_gather) before computing the
+    metrics. Only horizons present on every rank (1..min k_toks) are then reported. No effect
+    on a single device."""
 
     drift_enabled: bool = False
     """DriftMTP Phase 4: whether to add lambda_drift * L_drift^token (see
@@ -407,7 +434,7 @@ class SingleShotArgs:
     smoothl1_enabled: bool = False
     """Add lambda_SL1 * L_SL1 (per-horizon Smooth-L1 of student predictive states onto the
     stopped-gradient teacher states; see src/driftmtp/training.py compute_smoothl1_loss and
-    claudesmoothL1plan.md). Mutually exclusive with drift_enabled. Needs the student-forced
+    claudesmoothL1plan.md). Can be combined with drift_enabled (terms are summed). Needs the student-forced
     teacher pass, so incompatible with gt_teacher_supervision. smoothl1_weight=0.0 MUST
     reproduce native MTP training exactly."""
 

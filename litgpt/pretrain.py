@@ -457,13 +457,12 @@ def compile_utilities(compile_mode=None):
 
 
 def _validate_regulariser_flags(ss: SingleShotArgs) -> list:
-    """Reject invalid drift / Smooth-L1 combinations; return non-fatal warnings.
+    """Reject invalid drift / Smooth-L1 settings; return non-fatal warnings.
 
-    `raise`, not `assert`, so the check survives `python -O`. Standalone so it can be
-    tested without Fabric (tests/test_driftmtp_smoothl1.py). See claudesmoothL1plan.md.
+    Drift and Smooth-L1 may both be enabled: their weighted terms are summed into one
+    total loss. `raise`, not `assert`, so the check survives `python -O`. Standalone so it
+    can be tested without Fabric (tests/test_driftmtp_smoothl1.py). See claudesmoothL1plan.md.
     """
-    if ss.drift_enabled and ss.smoothl1_enabled:
-        raise ValueError("drift_enabled and smoothl1_enabled are both True; enable at most one.")
     if ss.smoothl1_enabled and not 0.0 < ss.smoothl1_beta_quantile < 1.0:
         raise ValueError(f"smoothl1_beta_quantile must be in (0, 1), got {ss.smoothl1_beta_quantile}.")
     warnings_out = []
@@ -472,6 +471,22 @@ def _validate_regulariser_flags(ss: SingleShotArgs) -> list:
     if ss.smoothl1_weight != 0.0 and not ss.smoothl1_enabled:
         warnings_out.append(f"smoothl1_weight={ss.smoothl1_weight} is ignored because smoothl1_enabled=False.")
     return warnings_out
+
+
+def _validate_geometry_diag_flags(ss: SingleShotArgs, log_interval: int) -> None:
+    """Reject geometry-diagnostic settings that would compute metrics that are never logged
+    or cannot be computed. See distancdiagplan.md and src/driftmtp/geometry.py."""
+    if not ss.geometry_diag_enabled:
+        return
+    if ss.gt_teacher_supervision:
+        raise ValueError("geometry_diag_enabled needs the student-forced teacher pass, which gt_teacher_supervision skips.")
+    if ss.geometry_diag_interval < 1 or ss.geometry_diag_interval % log_interval != 0:
+        raise ValueError(
+            f"geometry_diag_interval ({ss.geometry_diag_interval}) must be a positive multiple of "
+            f"train.log_interval ({log_interval})."
+        )
+    if ss.geometry_diag_mmd_warmup_steps < 1:
+        raise ValueError(f"geometry_diag_mmd_warmup_steps must be >= 1, got {ss.geometry_diag_mmd_warmup_steps}.")
 
 
 def setup(
@@ -552,8 +567,9 @@ def setup(
     # for ease of use and cleaner accessing, has a to_dict method if necessary
     hparams = dict2attr(hparams)
 
-    # Before any model is built: drift and Smooth-L1 regularise the same states.
+    # Before any model is built: validate the drift / Smooth-L1 regulariser settings.
     regulariser_warnings = _validate_regulariser_flags(hparams.singleshot)
+    _validate_geometry_diag_flags(hparams.singleshot, train.log_interval)
     
     # FIXME there should be a more elegant way to do this, but I couldnt figure out the
     # runtime call order for the dataclass inits versus the overrides via yaml and cmdline.
@@ -876,6 +892,22 @@ def main(
         if hparams.singleshot.k_toks_max is not None:
             k_max = max(k_max, hparams.singleshot.k_toks_max.max_k_toks_value)
         state["smoothl1_beta"] = SmoothL1BetaState(k_max=k_max, device=fabric.device)
+    # MMD kernel bandwidths (horizon 1, frozen after warmup) are checkpointed so a resume
+    # restores them instead of re-estimating from one batch, which shifted the MMD curve.
+    # One per diagnostic hook, under its own key; see docs/geometry_diagnostics_report.md.
+    if hparams.singleshot.drift_diagnostics_enabled or hparams.singleshot.geometry_diag_enabled:
+        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
+        if _driftmtp_src_dir not in sys.path:
+            sys.path.insert(0, _driftmtp_src_dir)
+        from driftmtp.metrics.mmd import MMDBandwidthSchedule
+        if hparams.singleshot.drift_diagnostics_enabled:
+            state["drift_diag_mmd_bandwidth"] = MMDBandwidthSchedule(
+                warmup_steps=hparams.singleshot.drift_diagnostics_mmd_warmup_steps
+            )
+        if hparams.singleshot.geometry_diag_enabled:
+            state["geometry_mmd_bandwidth"] = MMDBandwidthSchedule(
+                warmup_steps=hparams.singleshot.geometry_diag_mmd_warmup_steps
+            )
 
 
     resume = find_resume_path(fabric, resume, out_dir)
@@ -886,11 +918,20 @@ def main(
         teacher_model_ref = state.pop("model_teacher")
         if train.ignore_dataloader_state_on_resume:
             train_dataloader = state.pop("train_dataloader")
+        # Bandwidth schedules are optional in the checkpoint: one saved before they were
+        # checkpointed has no such key, which a strict fabric.load would reject. Restore them
+        # from the unrequested remainder instead; when absent they start fresh.
+        bandwidth_keys = ("drift_diag_mmd_bandwidth", "geometry_mmd_bandwidth")
+        bandwidth_refs = {k: state.pop(k) for k in bandwidth_keys if k in state}
         
-        fabric.load(resume, state)
+        remainder = fabric.load(resume, state)
         
         # reinsert any removed items necessary
         state["model_teacher"] = teacher_model_ref
+        for key, schedule in bandwidth_refs.items():
+            if key in remainder:
+                schedule.load_state_dict(remainder[key])
+            state[key] = schedule
         if train.ignore_dataloader_state_on_resume:
             state["train_dataloader"] = train_dataloader
 
@@ -1151,13 +1192,30 @@ def fit(
         if _driftmtp_src_dir not in sys.path:
             sys.path.insert(0, _driftmtp_src_dir)
         from driftmtp.validation import compute_training_diagnostics as compute_training_diagnostics_fn
-        from driftmtp.metrics.mmd import MMDBandwidthSchedule
-        # One shared instance for the whole run: recomputes the MMD kernel bandwidth from
-        # horizon-1 features on every diagnostic step while warming up, then freezes it, so
-        # the MMD trend over training is measured against one fixed baseline. See mmd.py.
-        mmd_bandwidth_schedule = MMDBandwidthSchedule(
-            warmup_steps=hparams.singleshot.drift_diagnostics_mmd_warmup_steps
-        )
+        # One instance for the whole run, kept in the checkpointed state: recomputes the MMD
+        # kernel bandwidth from horizon-1 features on every diagnostic step while warming up,
+        # then freezes it, so the MMD trend is measured against one fixed baseline. See mmd.py.
+        mmd_bandwidth_schedule = state["drift_diag_mmd_bandwidth"]
+
+    # Global geometry diagnostics (distancdiagplan.md): monitoring only, independent of the
+    # drift / Smooth-L1 flags, so every arm logs the same diag/* fields. Settings are checked
+    # in _validate_geometry_diag_flags. Its MMD bandwidth schedule is its own (checkpointed) instance.
+    compute_geometry_diag_fn = None
+    geometry_bandwidth_schedule = None
+    geometry_gather_fn = None
+    geometry_iter_interval = None
+    if hparams.singleshot.geometry_diag_enabled:
+        _driftmtp_src_dir = str(Path(__file__).resolve().parents[3] / "src")
+        if _driftmtp_src_dir not in sys.path:
+            sys.path.insert(0, _driftmtp_src_dir)
+        from driftmtp.geometry import compute_geometry_diagnostics as compute_geometry_diag_fn
+        from driftmtp.geometry import gather_predictive_states
+        geometry_bandwidth_schedule = state["geometry_mmd_bandwidth"]
+        if hparams.singleshot.geometry_diag_gather and fabric.world_size > 1:
+            geometry_gather_fn = lambda s, t: gather_predictive_states(fabric.all_gather, s, t)
+        # geometry_diag_interval is a multiple of train.log_interval, so these iterations are
+        # always logged iterations.
+        geometry_iter_interval = hparams.singleshot.geometry_diag_interval * train.gradient_accumulation_iters(devices, num_nodes)
 
     # DriftMTP Phase 4 (training): resolve the token-drifting loss hook once, only when
     # enabled, so a disabled run never imports or touches src/driftmtp/ at all (same pattern as
@@ -1191,7 +1249,7 @@ def fit(
         running_drift_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=hparams.train.sync_running_metrics, nan_strategy="error").to(fabric.device)
 
     # Smooth-L1 feature regulariser (claudesmoothL1plan.md): same hook pattern and same
-    # constraints as the drift loss above, which it is mutually exclusive with.
+    # constraints as the drift loss above, and can be enabled together with it.
     smoothl1_enabled = hparams.singleshot.smoothl1_enabled
     compute_smoothl1_loss_fn = None
     extract_smoothl1_pair_fn = None
@@ -1287,13 +1345,19 @@ def fit(
         )
         drift_diagnostics = {}
 
+        run_geometry_diag = (
+            compute_geometry_diag_fn is not None
+            and state["iter_num"] % geometry_iter_interval == 0
+        )
+        geometry_diagnostics = {}
+
         # DriftMTP Phase 4 (training): unlike run_drift_diagnostics above, this must be True on
         # EVERY iteration drift training is enabled (L_drift needs to backprop every step, not
         # just on logged iterations). Hidden states are requested whenever either consumer needs
         # them: drift_enabled (every step) or run_drift_diagnostics (logged steps only, when
         # diagnostics are on but drift training is off). gt_teacher_supervision is already
         # asserted against at hook-resolution time for the drift-loss path.
-        need_hidden_states = drift_enabled or smoothl1_enabled or run_drift_diagnostics
+        need_hidden_states = drift_enabled or smoothl1_enabled or run_drift_diagnostics or run_geometry_diag
 
         data_mask_prep_t0 = time.perf_counter()
         train_data_len = train_data.shape[1] - 1
@@ -1543,6 +1607,23 @@ def fit(
                             step=state["step_count"],
                         )
 
+                    # Global geometry diagnostics: detached, no_grad, floats out; never
+                    # touches loss or gradients. Collective when geometry_gather_fn is set,
+                    # which is safe because every rank shares iter_num.
+                    if run_geometry_diag:
+                        geometry_diag_t0 = time.perf_counter()
+                        geometry_diagnostics = compute_geometry_diag_fn(
+                            student_hidden_full=student_hidden,
+                            teacher_hidden_full=teacher_hidden,
+                            pred_pos_mask=pred_pos_mask,
+                            tot_mask_regions=tot_mask_regions,
+                            k_toks=k_toks,
+                            bandwidth_schedule=geometry_bandwidth_schedule,
+                            step=state["step_count"],
+                            gather_fn=geometry_gather_fn,
+                        )
+                        geometry_diagnostics["diag/time_s"] = time.perf_counter() - geometry_diag_t0
+
             if hparams.singleshot.last_region_loss_only:
                 assert not (hparams.data == "pqds" and hparams.pqds.omit_tail_padding_in_loss), "Not supported to omit tail padding when using last_region_loss_only."
                 # we consider only the last region per sequence for loss and metrics
@@ -1681,9 +1762,10 @@ def fit(
                 total_loss = loss
             drift_loss_t1 = time.perf_counter()
 
-            # Smooth-L1 (claudesmoothL1plan.md): L_total = L_MTP + lambda_SL1 * L_SL1. beta_j is an
-            # EMA updated every micro-step while the LR is warming up (get_lr's `it` is
-            # iter_num - 1 here, since iter_num was already incremented), then frozen once.
+            # Smooth-L1 (claudesmoothL1plan.md): L_total += lambda_SL1 * L_SL1, on top of the drift
+            # term above when both are enabled. beta_j is an EMA updated every micro-step while
+            # the LR is warming up (get_lr's `it` is iter_num - 1 here, since iter_num was
+            # already incremented), then frozen once.
             smoothl1_loss_t0 = time.perf_counter()
             smoothl1_loss = torch.tensor(0.0, device=fabric.device)
             if smoothl1_enabled:
@@ -1702,7 +1784,7 @@ def fit(
                 smoothl1_result = compute_smoothl1_loss_fn(sl1_x, sl1_y, beta=smoothl1_beta_state.beta)
                 smoothl1_loss = smoothl1_result.loss
                 smoothl1_accum_tracker.update(smoothl1_result, k_toks)
-                total_loss = loss + hparams.singleshot.smoothl1_weight * smoothl1_loss
+                total_loss = total_loss + hparams.singleshot.smoothl1_weight * smoothl1_loss
             smoothl1_loss_t1 = time.perf_counter()
 
             bwd_t0 = time.perf_counter()
@@ -1894,6 +1976,8 @@ def fit(
             # DriftMTP Phase 2 (diagnostic-only): no-op dict {} on iterations where
             # run_drift_diagnostics was False (disabled, off-cadence, or gt_teacher_supervision).
             metrics.update(drift_diagnostics)
+            # Global geometry diagnostics: {} except on geometry_diag_interval steps.
+            metrics.update(geometry_diagnostics)
             # DriftMTP Phase 4 (training): native/drift/total loss + the S_j / lambda_{tau,j} /
             # field-RMS gradient-accumulation stability triplet (mean, std, mean/std ratio) over
             # this optimizer step's micro-substeps. See claudedriftingplan.md > PHASE 4 >
@@ -1945,6 +2029,10 @@ def fit(
                 }
                 sl1_metrics.update(smoothl1_accum_tracker.compute(smoothl1_beta_state))
                 metrics.update(sl1_metrics)
+            # drift/total_loss and sl1/total_loss each add only their own term; with both on,
+            # log the objective that is actually backpropagated.
+            if drift_enabled and smoothl1_enabled:
+                metrics["reg/total_loss"] = native_mtp_loss + weighted_drift_loss + weighted_sl1_loss
             # extra metrics block
             if hparams.singleshot.extra_train_metrics:
                 metrics.update(stud_forced_teach_loss)
