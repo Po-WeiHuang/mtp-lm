@@ -412,8 +412,26 @@ class SingleShotArgs:
     the original construction. Masking both sides restores the symmetry the paper's unpaired
     positives have for free.
 
-    True (default) is the symmetric construction. False reproduces the original asymmetric one;
-    use it only to reproduce runs from before this change."""
+    True (default) is the symmetric construction, but it also discards the paired alignment
+    signal a_ii * (y_i - x_i). False + drift_tie_self_negative=True is the alternative that keeps
+    it: the self-positive stays and the self-negative is given the matching weight, which removes
+    the residual instead (tied_self_negative_derivation.md). False alone reproduces the original
+    asymmetric construction."""
+
+    drift_tie_self_negative: bool = False
+    """DriftMTP (claudetiedselfnegplan.md): give the query's own detached student state a weight
+    in the NEGATIVE population equal to its self-positive weight a_ii, and scale the other
+    negatives by (1 - a_ii). Removes the spurious a_ii * (x_i - N_i) push that the asymmetric
+    construction (self-positive kept, self-negative masked) leaves at student == teacher, while
+    keeping both the paired pull a_ii * (y_i - x_i) and the unpaired drift. Requires
+    drift_exclude_self_positive=False and drift_use_column_norm=False. False reproduces the
+    current field exactly."""
+
+    drift_freeze_field_scale: bool = False
+    """DriftMTP (claudetiedselfnegplan.md): during LR warmup, normalise each (horizon, tau) field
+    by its live batch RMS lambda_{tau,j} as now, while tracking an EMA of it; at the end of warmup
+    freeze the EMA (DDP-averaged) and divide by the frozen value from then on, so the drift field
+    can fade as the student converges. Checkpointed. False reproduces current behaviour."""
 
     drift_temperatures: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
     """DriftMTP Phase 4: the base Laplace-kernel temperatures tau (claudedriftingplan.md >
