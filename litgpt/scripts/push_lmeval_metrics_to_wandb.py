@@ -44,6 +44,9 @@ _CONTROLLED_PER_HORIZON_KEYS = (
     "mean_joint_confidence",
     "mmd",
     "sinkhorn",
+    "sinkhorn_divergence",
+    "energy_distance",
+    "energy_distance_normalized",
     "n_samples",
     # Bin-occupancy diagnostics for the two ECEs above -- how many bins the
     # population reached, how concentrated it was, and how much of each ECE
@@ -67,6 +70,9 @@ _CONTROLLED_AGGREGATE_KEYS = (
     "ece_stud_teach_joint",
     "mmd/mean",
     "sinkhorn/mean",
+    "sinkhorn_divergence/mean",
+    "energy_distance/mean",
+    "energy_distance_normalized/mean",
     "avg_effective_k",
 )
 
@@ -84,6 +90,7 @@ _CONTROLLED_CONFIG_KEYS = (
     "student_checkpoint",
     "teacher_checkpoint",
     "mmd_bandwidth",
+    "sinkhorn_epsilon",
     "min_band_samples",
 )
 

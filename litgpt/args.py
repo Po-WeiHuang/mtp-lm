@@ -354,8 +354,8 @@ class SingleShotArgs:
     geometry_diag_enabled: bool = True
     """Global student-teacher hidden-state geometry diagnostics (src/driftmtp/geometry.py,
     distancdiagplan.md): per-horizon D_SS / D_TT / D_ST statistics, paired vs nearest-teacher
-    distance, pairing gap, paired-teacher rank, spread ratio, teacher local scale, MMD and
-    Sinkhorn, logged per horizon as diag/h{h}/*. Monitoring only and
+    distance, pairing gap, paired-teacher rank, spread ratio, energy distance, teacher local
+    scale, MMD and Sinkhorn, logged per horizon as diag/h{h}/*. Monitoring only and
     independent of drift_enabled / smoothl1_enabled / drift_diagnostics_enabled, so baseline,
     Smooth-L1 and drifting runs log identical fields. On by default; set false explicitly to
     skip. Needs the student-forced teacher pass, so incompatible with gt_teacher_supervision
@@ -370,7 +370,9 @@ class SingleShotArgs:
     horizon 1 on each diagnostic step before being frozen. Same policy as
     drift_diagnostics_mmd_warmup_steps, but a separate MMDBandwidthSchedule instance, so the
     diag/ MMD does not depend on whether drift diagnostics are also on. Saved in checkpoints
-    and logged as diag/mmd_bandwidth."""
+    and logged as diag/mmd_bandwidth. The diag/ Sinkhorn eps (1.0 * horizon 1's d_st_std,
+    SinkhornEpsilonSchedule) uses the same warmup, is also checkpointed, and is logged as
+    diag/sinkhorn_epsilon."""
 
     geometry_diag_gather: bool = False
     """Pool the diagnostic population across ranks (detached all_gather) before computing the
