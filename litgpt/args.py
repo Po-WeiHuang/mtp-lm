@@ -465,6 +465,20 @@ class SingleShotArgs:
     """Quantile q of |student - teacher| that sets beta_j per horizon. beta_j is an EMA of
     it during LR warmup and frozen afterwards. Must be in (0, 1)."""
 
+    horizon_weight_enabled: bool = False
+    """Horizon-weighted training loss (fixedkweightedplan_zh-TW.md; src/driftmtp/horizon_weighting.py).
+    False (default): the MTP token loss, the drift loss and the Smooth-L1 loss are each mean-pooled
+    over all predicted positions, exactly as before, and horizon_loss_gamma is not read. True: each
+    of the three becomes sum_j w_j * l_j, where l_j is that loss averaged over the regions of
+    horizon j and w_j = gamma^(j-1) / sum_{i=1..k} gamma^(i-1) is normalised over the k_toks of the
+    current step (so it also works with random k). Not supported with hard_self_teacher_supervision."""
+
+    horizon_loss_gamma: float = 0.9
+    """gamma of horizon_weight_enabled, in (0, 1]; only read when that switch is True. 1.0 equals
+    mean pooling. The default 0.9 gives horizon 1 a weight of 15.4% at fixed k = 10, the closest to
+    the 15.9% it has under k ~ U[2,16] with mean pooling (fixedkweightedplan_zh-TW.md, table B).
+    0.8 is the value in EAGLE-3's training code."""
+
 
 def parse_temp_sep_token_id_range(temp_sep_token_id_range: str):
     """'128011-128255' -> (128011, 128255)"""
